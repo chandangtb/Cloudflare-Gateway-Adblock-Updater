@@ -1,0 +1,2 @@
+# Domains (and all their subdomains) you never want blocked. One per line.
+# example.com

@@ -40,6 +40,17 @@ MAX_CONCURRENT_REQUESTS = int(os.environ.get('MAX_CONCURRENT_REQUESTS', '5'))
 # Version tracking configuration
 Fresh_Start = os.environ.get('FRESH_START', 'false').lower() == 'true'
 CHECK_VERSIONS = os.environ.get('CHECK_VERSIONS', 'true').lower() == 'true'
+DRY_RUN = os.environ.get('DRY_RUN', 'false').lower() == 'true'
+# Abort if a downloaded list has fewer domains than this (protects against truncated/empty mirrors)
+MIN_DOMAINS = int(os.environ.get('MIN_DOMAINS', '50000'))
+# Optional user files (same folder as this script)
+ALLOWLIST_FILE = os.environ.get('ALLOWLIST_FILE', 'allowlist.txt')
+CUSTOM_BLOCKLIST_FILE = os.environ.get('CUSTOM_BLOCKLIST_FILE', 'custom-blocklist.txt')
+# Optional notifications
+TELEGRAM_BOT_TOKEN = os.environ.get('TELEGRAM_BOT_TOKEN')
+TELEGRAM_CHAT_ID = os.environ.get('TELEGRAM_CHAT_ID')
+DISCORD_WEBHOOK_URL = os.environ.get('DISCORD_WEBHOOK_URL')
+NOTIFY_ON_SUCCESS = os.environ.get('NOTIFY_ON_SUCCESS', 'false').lower() == 'true'
 
 # API base URL
 base_url = f"https://api.cloudflare.com/client/v4/accounts/{account_id}/gateway"
@@ -144,6 +155,28 @@ def fetch_blocklist_version(url: str, backup_url1: Optional[str], backup_url2: O
     logger.warning(f"  ⚠️ No version info found for {filter_name}")
     return None
 
+def resolve_precedence(filter_config: Dict, cached_rules: List[Dict]) -> int:
+    """
+    Cloudflare requires every Gateway rule to have a UNIQUE precedence.
+    Return the target precedence if it is free (or already ours); otherwise
+    keep our existing policy's precedence, or pick the next free number.
+    """
+    name = filter_config['name']
+    target = filter_config.get('priority', 99)
+    own = next((r for r in cached_rules if r.get('name') == name), None)
+    taken = {r.get('precedence') for r in cached_rules if r is not own}
+
+    if target not in taken:
+        return target
+    if own is not None and own.get('precedence') not in taken and own.get('precedence') is not None:
+        logger.warning(f"  ⚠️ Precedence {target} is used by another rule; keeping current {own['precedence']} for {name}")
+        return own['precedence']
+    new_prec = target
+    while new_prec in taken:
+        new_prec += 1
+    logger.warning(f"  ⚠️ Precedence {target} is already used by another rule; using {new_prec} for {name}")
+    return new_prec
+
 def should_update_filter(filter_config: Dict, cached_rules: List[Dict]) -> tuple:
     """
     Check if a filter needs updating based on version comparison AND policy existence.
@@ -193,7 +226,7 @@ def should_update_filter(filter_config: Dict, cached_rules: List[Dict]) -> tuple
         return True, current_version, "Version changed"
     
     # Check if precedence matches
-    target_precedence = filter_config.get('priority')
+    target_precedence = resolve_precedence(filter_config, cached_rules)
     current_precedence = policy.get('precedence')
     
     if target_precedence is not None and current_precedence != target_precedence:
@@ -524,7 +557,7 @@ def update_policy_for_filter(filter_config: Dict, final_list_ids: List[str],
 
     # Build traffic expression
     expression = " or ".join([f"any(dns.domains[*] in ${lid})" for lid in final_list_ids])
-    priority = filter_config.get('priority', 99)
+    priority = resolve_precedence(filter_config, cached_rules)
     
     # Build description with version info
     description = build_description_with_version(
@@ -557,12 +590,81 @@ def update_policy_for_filter(filter_config: Dict, final_list_ids: List[str],
     else:
         logger.info(f"✍️ Creating new policy '{policy_name}'...")
         # Fallback to sync request for creation as we didn't make an async helper for simple POST rule
+        for _ in range(20):
+            try:
+                response = api_request('POST', f"{base_url}/rules", policy_payload)
+                if response.status_code == 409 and '2011' in response.text:
+                    policy_payload["precedence"] += 1
+                    logger.warning(f"⚠️ Precedence taken, retrying with {policy_payload['precedence']}...")
+                    continue
+                check_api_response(response, f"creating policy {policy_name}")
+                return True
+            except Exception as e:
+                logger.error(f"🚫 Policy creation failed: {e}")
+                return False
+        return False
+
+# ---------------------------------------------------------------------------
+# Extra helpers: notifications, allow/custom lists, job summary
+# ---------------------------------------------------------------------------
+def notify(message: str) -> None:
+    """Send a message to Telegram and/or Discord if configured. Never raises."""
+    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
         try:
-            response = api_request('POST', f"{base_url}/rules", policy_payload)
-            check_api_response(response, f"creating policy {policy_name}")
-            return True
-        except:
-            return False
+            requests.post(
+                f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage",
+                json={"chat_id": TELEGRAM_CHAT_ID, "text": message[:4000]},
+                timeout=15,
+            )
+        except Exception as e:
+            logger.warning(f"⚠️ Telegram notification failed: {type(e).__name__}")
+    if DISCORD_WEBHOOK_URL:
+        try:
+            requests.post(DISCORD_WEBHOOK_URL, json={"content": message[:1900]}, timeout=15)
+        except Exception as e:
+            logger.warning(f"⚠️ Discord notification failed: {type(e).__name__}")
+
+def load_domain_file(path: str) -> set:
+    """Load a plain-text domain file (one per line, # comments allowed)."""
+    domains = set()
+    if not os.path.isfile(path):
+        return domains
+    with open(path, encoding='utf-8') as f:
+        for line in f:
+            line = line.split('#', 1)[0].strip().lower()
+            if line and is_valid_domain(line):
+                domains.add(line)
+    return domains
+
+def apply_allowlist(domains: set, allow: set) -> set:
+    """Remove allowlisted domains and any of their subdomains."""
+    if not allow:
+        return domains
+    kept = set()
+    for d in domains:
+        parts = d.split('.')
+        # check d itself and every parent domain against the allowlist
+        if any('.'.join(parts[i:]) in allow for i in range(len(parts) - 1)):
+            continue
+        kept.add(d)
+    return kept
+
+def write_job_summary(text: str) -> None:
+    """Append to the GitHub Actions job summary when running in Actions."""
+    path = os.environ.get('GITHUB_STEP_SUMMARY')
+    if path:
+        try:
+            with open(path, 'a', encoding='utf-8') as f:
+                f.write(text + "\n")
+        except OSError:
+            pass
+
+def rollback_lists(list_ids: List[str]) -> None:
+    """Delete lists created during this run (used when the policy step fails)."""
+    if not list_ids:
+        return
+    logger.warning(f"↩️ Rolling back {len(list_ids)} lists created in this run...")
+    asyncio.run(async_delete_lists_batch([{'id': i, 'name': i} for i in list_ids]))
 
 def process_filter_async(filter_config: Dict, cached_lists: List[Dict], 
                         cached_rules: List[Dict]) -> Dict:
@@ -615,11 +717,36 @@ def process_filter_async(filter_config: Dict, cached_lists: List[Dict],
         if line and not line.startswith('#') and is_valid_domain(line):
             target_domains.add(line)
 
-    logger.info(f"🎯 Target domains: {len(target_domains):,}")
+    logger.info(f"🎯 Source domains: {len(target_domains):,}")
 
     if not target_domains and not Fresh_Start: # Safety check, unless forced
         logger.warning(f"🚫 No domains found in source! Aborting to prevent emptying lists.")
         return {'success': False, 'filter': filter_name}
+
+    # Sanity check: refuse suspiciously small downloads (truncated / broken mirror)
+    if len(target_domains) < MIN_DOMAINS:
+        logger.error(f"🚫 Only {len(target_domains):,} domains (< MIN_DOMAINS={MIN_DOMAINS:,}). "
+                     f"Aborting to avoid wiping good rules. Lower MIN_DOMAINS if this is intentional.")
+        return {'success': False, 'filter': filter_name}
+
+    # Custom blocklist and allowlist (optional files)
+    custom = load_domain_file(CUSTOM_BLOCKLIST_FILE)
+    if custom:
+        target_domains |= custom
+        logger.info(f"➕ Added {len(custom):,} domains from {CUSTOM_BLOCKLIST_FILE}")
+    allow = load_domain_file(ALLOWLIST_FILE)
+    if allow:
+        before = len(target_domains)
+        target_domains = apply_allowlist(target_domains, allow)
+        logger.info(f"✅ Allowlist removed {before - len(target_domains):,} domains ({len(allow)} entries)")
+
+    logger.info(f"🎯 Target domains: {len(target_domains):,}")
+
+    if DRY_RUN:
+        needed = -(-len(target_domains) // CHUNK_SIZE)
+        logger.info(f"🧪 DRY RUN: would sync {len(target_domains):,} domains into ~{needed} lists "
+                    f"(version {current_version}). No changes made.")
+        return {'success': True, 'filter': filter_name, 'domains': len(target_domains), 'lists': 0, 'dry_run': True}
 
     # Identify existing lists for this filter
     existing_lists = [lst for lst in cached_lists if lst['name'].startswith(list_prefix)]
@@ -678,6 +805,7 @@ def process_filter_async(filter_config: Dict, cached_lists: List[Dict],
         policy_success = update_policy_for_filter(filter_config, new_list_ids, len(target_domains), cached_rules, current_version)
 
         if not policy_success:
+            rollback_lists(new_list_ids)
             return {'success': False, 'filter': filter_name}
 
         return {'success': True, 'filter': filter_name, 'domains': len(target_domains), 'lists': len(new_list_ids)}
@@ -862,6 +990,7 @@ def process_filter_async(filter_config: Dict, cached_lists: List[Dict],
         asyncio.run(async_delete_lists_batch(lists_to_delete))
 
     if not policy_success:
+        rollback_lists(new_list_ids)
         return {'success': False, 'filter': filter_name}
 
     return {'success': True, 'filter': filter_name, 'domains': len(target_domains), 'lists': len(final_list_ids)}
@@ -873,7 +1002,8 @@ if __name__ == "__main__":
     logger.info("🎬 Starting Cloudflare Gateway Adblock Update...\n")
     logger.info(f"🆕 Fresh start: {'YES' if Fresh_Start else 'NO'}")
     logger.info(f"🧬 Check versions: {'ENABLED' if CHECK_VERSIONS else 'DISABLED'}")
-    logger.info(f"🏎️ Max concurrent requests: {MAX_CONCURRENT_REQUESTS}\n")
+    logger.info(f"🏎️ Max concurrent requests: {MAX_CONCURRENT_REQUESTS}")
+    logger.info(f"🧪 Dry run: {'YES' if DRY_RUN else 'NO'}\n")
 
     # Cache current rules for version checking from policy descriptions
     logger.info("📡 Fetching current policies to check versions...")
@@ -922,6 +1052,7 @@ if __name__ == "__main__":
         logger.info(f"📋 Cached {len(cached_rules)} rules and {len(cached_lists)} lists\n")
     except Exception as e:
         logger.error(f"🚫 Failed to cache rules/lists: {e}", exc_info=True)
+        notify(f"❌ Cloudflare Gateway update failed while reading rules/lists: {type(e).__name__}")
         sys.exit(1)
 
     # Process filters with async
@@ -977,6 +1108,16 @@ if __name__ == "__main__":
 
     if stats['errors']:
         logger.warning(f"\n⚠️ Failed filters ({len(stats['errors'])}): {', '.join(stats['errors'])}")
+        write_job_summary(f"### ❌ Gateway update failed\nFailed filters: {', '.join(stats['errors'])}")
+        notify(f"❌ Cloudflare Gateway update FAILED: {', '.join(stats['errors'])}")
         sys.exit(1)
     else:
         logger.info("\n✅✅ All filters updated successfully!")
+        write_job_summary(f"### ✅ Gateway update{' (dry run)' if DRY_RUN else ''}\n"
+                          f"- Filters updated: {stats['filters_processed']}/{len(filters_to_update)}\n"
+                          f"- Domains: {stats['total_domains']:,}\n"
+                          f"- Lists created: {stats['lists_created']}\n"
+                          f"- Time: {script_elapsed:.1f}s")
+        if NOTIFY_ON_SUCCESS:
+            notify(f"✅ Cloudflare Gateway updated: {stats['total_domains']:,} domains, "
+                   f"{stats['lists_created']} new lists.")

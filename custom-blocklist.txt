@@ -1,0 +1,2 @@
+# Extra domains you want blocked in addition to Hagezi. One per line.
+# ads.example.net

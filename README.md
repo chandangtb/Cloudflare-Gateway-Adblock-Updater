@@ -39,6 +39,34 @@ The Python script in this repository automates updating your Cloudflare Zero Tru
 
   Designed to run seamlessly via GitHub Actions or on your local device, making scheduled and hands-off updates easy.
 
+- **Unique precedence handling**
+
+  If the configured precedence (10000) is already used by another Gateway rule, the script automatically uses a free one instead of failing with error 2011.
+
+- **Automatic rollback**
+
+  If the policy step fails, lists created during that run are deleted so no orphaned lists are left behind.
+
+- **Safety checks**
+
+  Aborts if a downloaded list has fewer than `MIN_DOMAINS` (default 50,000) domains.
+
+- **Allowlist and custom blocklist**
+
+  Put domains in `allowlist.txt` (they and their subdomains are removed from the blocklist) or `custom-blocklist.txt` (extra domains to block).
+
+- **Dry run**
+
+  `DRY_RUN=true` (or the *dry run* option when starting the workflow manually) reports what would happen without changing Cloudflare.
+
+- **Notifications**
+
+  Optional Telegram (`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`) and Discord (`DISCORD_WEBHOOK_URL`) alerts on failure. Set `NOTIFY_ON_SUCCESS=true` for success messages too. Add these as repository secrets.
+
+- **Workflow hardening**
+
+  Concurrency lock, 30-minute timeout and a GitHub job summary.
+
 # Setup Guide
 
 ## Cloudflare credentials
